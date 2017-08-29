@@ -4,14 +4,18 @@
             [fulcro.i18n :as i18n]
             [fulcro.client.impl.data-fetch :as f]
             [fulcro.client.util :as util]
-    #?(:cljs [cljs.core.async :as async]
-       :clj
-            [clojure.core.async :as async :refer [go]])
+            #?(:cljs [cljs.core.async :as async]
+               :clj
+               [clojure.core.async :as async :refer [go go-loop]])
             [fulcro.client.network :as net]
             [fulcro.client.impl.om-plumbing :as plumbing])
   #?(:cljs (:require-macros
-             [cljs.core.async.macros :refer [go]])))
-
+            [cljs.core.async.macros :refer [go go-loop]])))
+;; Current Problem
+;; Tracked down the issue to the reconciler loop
+;; I see a successful put on the queue,
+;; the queue becomes unblocked,
+;; there's a take!, but no value.
 (defn fallback-handler
   "This internal function is responsible for generating and returning a function that can accomplish calling the fallbacks that
   appear in an incoming Om transaction, which is in turn used by the error-handling logic of the plumbing."
@@ -24,16 +28,20 @@
       (log/warn "Fallback triggered, but no fallbacks were defined."))))
 
 ;; this is here so we can do testing (can mock core async stuff out of the way)
+(def enqueued-count (atom 0))
 (defn- enqueue
   "Enqueue a send to the network queue. This is a standalone function because we cannot mock core async functions."
   [q v]
-  (go (async/>! q v)))
+  (assert q)
+  (assert v)
+  (go (async/put! q v (fn []
+                        (swap! enqueued-count inc)))))
 
 (defn real-send
   "Do a properly-plumbed network send. This function recursively strips ui attributes from the tx and pushes the tx over
   the network. It installs the given on-load and on-error handlers to deal with the network response."
   [net tx on-done on-error on-load]
-  ; server-side rendering doesn't do networking. Don't care.
+                                        ; server-side rendering doesn't do networking. Don't care.
   (if #?(:clj  false
          :cljs (implements? net/ProgressiveTransfer net))
     (net/updating-send net (plumbing/strip-ui tx) on-done on-error on-load)
@@ -78,7 +86,7 @@
           fallback                 (fallback-handler app full-remote-transaction)
           desired-remote-mutations (plumbing/remove-loads-and-fallbacks full-remote-transaction)
           tx-list                  (split-mutations desired-remote-mutations)
-          ; todo: split remote mutations
+                                        ; todo: split remote mutations
           has-mutations?           (fn [tx] (> (count tx) 0))
           payload                  (fn [tx]
                                      {:query    tx
@@ -106,7 +114,7 @@
       (doseq [{:keys [query on-load on-error load-descriptors]} parallel-payload]
         (let [on-load'  #(on-load % load-descriptors)
               on-error' #(on-error % load-descriptors)]
-          ; TODO: queries cannot report progress, yet. Could update the payload marker in app state.
+                                        ; TODO: queries cannot report progress, yet. Could update the payload marker in app state.
           (real-send network query on-load' on-error' nil)))
       (loop [fetch-payload (f/mark-loading remote reconciler)]
         (when fetch-payload
@@ -141,8 +149,8 @@
   next request to go. Be very careful with this code, as bugs will cause applications to stop responding
   to remote requests."
   [network payload send-complete]
-  ; Note, only data-fetch reads will have load-descriptors,
-  ; in which case the payload on-load is data-fetch/loaded-callback, and cannot handle updates.
+                                        ; Note, only data-fetch reads will have load-descriptors,
+                                        ; in which case the payload on-load is data-fetch/loaded-callback, and cannot handle updates.
   (let [{:keys [query on-load on-error load-descriptors]} payload
         merge-data (if load-descriptors #(on-load % load-descriptors) on-load)
         on-update  (if load-descriptors identity merge-data) ; TODO: queries cannot handle progress
@@ -168,14 +176,26 @@
           sequential?      (is-sequential? network)
           response-channel (get response-channels remote)
           send-complete    (if sequential?
-                             (fn [] (go (async/>! response-channel :complete)))
+                             (fn [] (go (async/put! response-channel :complete)))
                              identity)]
-      (go
-        (loop [payload (async/<! queue)]
-          (send-payload network payload send-complete)      ; async call. Calls send-complete when done
-          (when sequential?
-            (async/<! response-channel))                    ; block until send-complete
-          (recur (async/<! queue)))))))
+      (go-loop []
+        (async/<! (async/timeout 1000))
+        (println "Enqueued count: " enqueued-count)
+        (when (pos? @enqueued-count)
+          (println "Trying to grab enqueued val: ")
+          (println (async/<! queue)))
+        (recur))
+      (go-loop [payload (async/<! queue)]
+        (swap! enqueued-count dec)
+        (println "Seq loop payload: " payload)
+        (send-payload network payload send-complete)      ; async call. Calls send-complete when done
+        (when sequential?
+          (println "Blocked on response channel")
+          (async/<! (async/timeout 1000)) ;;
+          (println "Unblocked on response channel"))                    ; block until send-complete
+        (let [v (async/<! queue)]
+          (println "Value found to recur with!: " v)
+          (recur v))))))
 
 (defn initialize-internationalization
   "Configure a re-render when the locale changes and also when the translations arrive from a module load.
@@ -219,8 +239,8 @@
 
 (defn merge-handler [mutation-merge target source]
   (let [source-to-merge (->> source
-                          (filter (fn [[k _]] (not (symbol? k))))
-                          (into {}))
+                             (filter (fn [[k _]] (not (symbol? k))))
+                             (into {}))
         merged-state    (sweep-merge target source-to-merge)]
     (reduce (fn [acc [k v]]
               (if (and mutation-merge (symbol? k))
@@ -259,18 +279,18 @@
                                       (do
                                         (set-default-locale initial-state))))
         config                    (merge {}
-                                    reconciler-options
-                                    {:migrate     tempid-migrate
-                                     :state       initial-state-with-locale
-                                     :send        (fn [tx cb]
-                                                    (server-send (assoc app :reconciler @rec-atom) tx cb))
-                                     :normalize   true
-                                     :remotes     remotes
-                                     :merge-ident (fn [reconciler app-state ident props]
-                                                    (update-in app-state ident (comp sweep-one merge) props))
-                                     :merge-tree  (fn [target source]
-                                                    (merge-handler mutation-merge target source))
-                                     :parser      parser})
+                                         reconciler-options
+                                         {:migrate     tempid-migrate
+                                          :state       initial-state-with-locale
+                                          :send        (fn [tx cb]
+                                                         (server-send (assoc app :reconciler @rec-atom) tx cb))
+                                          :normalize   true
+                                          :remotes     remotes
+                                          :merge-ident (fn [reconciler app-state ident props]
+                                                         (update-in app-state ident (comp sweep-one merge) props))
+                                          :merge-tree  (fn [target source]
+                                                         (merge-handler mutation-merge target source))
+                                          :parser      parser})
         rec                       (om/reconciler config)]
     (reset! rec-atom rec)
     rec))
